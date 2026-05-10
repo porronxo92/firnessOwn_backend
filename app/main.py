@@ -1,12 +1,17 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import phases, exercises, logs, custom_exercises, stats, auth, onboarding, plan_tracking
 
 app = FastAPI(title="Training Tracker API", version="1.0.0")
 
+# Obtener URLs de CORS desde variables de entorno
+cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:4200").split(",")
+cors_origins = [origin.strip() for origin in cors_origins]  # Limpiar espacios en blanco
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4200", "https://tudominio.com"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
