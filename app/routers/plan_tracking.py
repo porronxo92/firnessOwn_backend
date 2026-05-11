@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc
 from sqlalchemy.exc import IntegrityError
@@ -798,6 +798,7 @@ async def get_exercise_name_history(
             ExerciseLog.created_at,
         )
         .join(PlanExercise, PlanExercise.id == ExerciseLog.plan_exercise_id)
+        # === exercise-history join continues below ===
         .join(PlanDay, PlanDay.id == PlanExercise.day_id)
         .join(PlanWeek, PlanWeek.id == PlanDay.week_id)
         .where(PlanWeek.plan_id == plan_id)
@@ -821,3 +822,81 @@ async def get_exercise_name_history(
         })
 
     return history
+
+
+# === GET ALL RECENT EXERCISE LOGS (for Registro view) ===
+
+@router.get("/plans/{plan_id}/recent-logs")
+async def get_plan_recent_logs(
+    plan_id: int,
+    limit: int = Query(200, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Devuelve todos los registros de ejercicio del plan, agrupados por ejercicio
+    (plan_exercise_id), con los datos agregados de cada serie.
+    Ordenado por fecha descendente. Para la vista Registro.
+    """
+    await get_user_plan(plan_id, current_user, db)
+
+    query = (
+        select(
+            ExerciseLog.plan_exercise_id,
+            PlanExercise.name.label("exercise_name"),
+            PlanExercise.muscle_group,
+            PlanDay.type.label("day_type"),
+            PlanDay.session_name,
+            PlanDay.day_name,
+            PlanWeek.week_number,
+            PlanWeek.phase_name,
+            func.count(ExerciseLog.id).label("sets_done"),
+            func.max(ExerciseLog.weight_kg).label("max_weight_kg"),
+            func.max(ExerciseLog.reps_done).label("max_reps_done"),
+            func.max(ExerciseLog.rir_actual).label("rir_actual"),
+            func.max(ExerciseLog.created_at).label("last_set_at"),
+        )
+        .join(PlanExercise, PlanExercise.id == ExerciseLog.plan_exercise_id)
+        .join(PlanDay, PlanDay.id == PlanExercise.day_id)
+        .join(PlanWeek, PlanWeek.id == PlanDay.week_id)
+        .where(PlanWeek.plan_id == plan_id)
+        .where(ExerciseLog.user_id == current_user.id)
+        .group_by(
+            ExerciseLog.plan_exercise_id,
+            PlanExercise.name,
+            PlanExercise.muscle_group,
+            PlanDay.type,
+            PlanDay.session_name,
+            PlanDay.day_name,
+            PlanWeek.week_number,
+            PlanWeek.phase_name,
+        )
+        .order_by(func.max(ExerciseLog.created_at).desc())
+        .limit(limit)
+    )
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    logs = []
+    for row in rows:
+        last_set_at = row.last_set_at
+        log_date = last_set_at.date().isoformat() if last_set_at else None
+        logs.append({
+            "plan_exercise_id": row.plan_exercise_id,
+            "exercise_name": row.exercise_name,
+            "muscle_group": row.muscle_group,
+            "day_type": row.day_type,
+            "session_name": row.session_name,
+            "day_name": row.day_name,
+            "week_number": row.week_number,
+            "phase_name": row.phase_name,
+            "sets_done": row.sets_done,
+            "max_weight_kg": float(row.max_weight_kg) if row.max_weight_kg else None,
+            "max_reps_done": row.max_reps_done,
+            "rir_actual": row.rir_actual,
+            "last_set_at": last_set_at.isoformat() if last_set_at else None,
+            "log_date": log_date,
+        })
+
+    return logs

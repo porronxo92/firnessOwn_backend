@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func
 from typing import List, Optional
@@ -23,7 +23,7 @@ def estimate_1rm(weight: float, reps: int) -> float:
 @router.get("/progress/{exercise_id}", response_model=ExerciseProgress)
 async def get_exercise_progress(
     exercise_id: int,
-    limit: int = 10,
+    limit: int = Query(10, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -189,7 +189,7 @@ async def get_summary(
 # Cardio endpoints
 @router.get("/cardio", response_model=List[CardioLogResponse])
 async def get_cardio_logs(
-    limit: int = 20,
+    limit: int = Query(20, ge=1, le=200),
     date_from: Optional[date] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)

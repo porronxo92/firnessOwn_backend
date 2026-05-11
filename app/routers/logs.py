@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from typing import List, Optional
@@ -19,7 +19,7 @@ router = APIRouter()
 async def get_logs(
     exercise_id: Optional[int] = None,
     custom_exercise_id: Optional[int] = None,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=200),
     date_from: Optional[date] = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)

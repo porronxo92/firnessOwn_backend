@@ -97,7 +97,11 @@ class GeneratedPlan(Base):
     is_active = Column(Boolean, default=True)
     started_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
-    
+
+    # Estado de generación asíncrona: 'pending' | 'generating' | 'completed' | 'error'
+    generation_status = Column(String(20), nullable=False, default='pending')
+    generation_error = Column(Text, nullable=True)
+
     # Información de generación
     gemini_prompt_used = Column(Text, nullable=True)
     gemini_model_version = Column(String(50), nullable=True)

@@ -37,7 +37,13 @@ async def get_db():
             yield session
             await session.commit()
         except Exception:
-            await session.rollback()
+            try:
+                await session.rollback()
+            except Exception:
+                # The DB connection may have been dropped (e.g. client disconnect
+                # while an external API call was in progress). Swallow the secondary
+                # rollback error so the original exception propagates cleanly.
+                pass
             raise
         finally:
             await session.close()

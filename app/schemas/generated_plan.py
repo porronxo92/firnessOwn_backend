@@ -17,10 +17,29 @@ class GeneratedPlanCreate(BaseModel):
     gemini_model_version: Optional[str] = None
 
 
+class PlanGenerationAccepted(BaseModel):
+    """Respuesta inmediata cuando se lanza la generación en background"""
+    plan_id: int
+    status: str  # 'generating'
+    message: str
+
+
+class PlanGenerationStatus(BaseModel):
+    """Estado actual de la generación de un plan"""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    generation_status: str  # 'pending' | 'generating' | 'completed' | 'error'
+    generation_error: Optional[str] = None
+    name: str
+    is_active: bool
+    created_at: Optional[datetime] = None
+
+
 class GeneratedPlanResponse(BaseModel):
     """Schema de respuesta del plan generado"""
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: int
     user_profile_id: int
     name: str
@@ -31,6 +50,8 @@ class GeneratedPlanResponse(BaseModel):
     primary_focus: Optional[str] = None
     plan_structure: Dict[str, Any]
     is_active: bool
+    generation_status: str = 'completed'
+    generation_error: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     created_at: Optional[datetime] = None

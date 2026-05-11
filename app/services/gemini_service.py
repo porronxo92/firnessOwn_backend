@@ -1,3 +1,4 @@
+import logging
 import os
 import httpx
 import json
@@ -5,6 +6,8 @@ from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
@@ -41,11 +44,15 @@ class GeminiService:
             "generationConfig": generation_config
         }
 
-        async with httpx.AsyncClient(timeout=180.0) as client:
+        # gemini-2.5-pro can take several minutes to stream large JSON responses.
+        # Use per-phase timeouts: short connect, long read (10 min).
+        timeout = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=15.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(self.api_url, headers=headers, json=payload)
 
             if response.status_code != 200:
-                raise Exception(f"Error en Gemini API: {response.status_code} - {response.text}")
+                logger.error("Gemini API error: status=%s", response.status_code)
+                raise Exception(f"Error en Gemini API: {response.status_code}")
 
             return response.json()
 

@@ -1,11 +1,16 @@
+import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timezone
 from typing import Optional
+import asyncio
+import httpx
 
-from app.database import get_db
+logger = logging.getLogger(__name__)
+
+from app.database import get_db, async_session
 from app.auth import get_current_user
 from app.models.user import User
 from app.models.user_profile import UserProfile
@@ -17,7 +22,7 @@ from app.schemas.user_profile import (
     OnboardingStep4, OnboardingStep5, OnboardingStep6
 )
 from app.schemas.generated_plan import (
-    GeneratedPlanResponse, GeneratedPlanSummary,
+    GeneratedPlanResponse, GeneratedPlanSummary, PlanGenerationAccepted, PlanGenerationStatus,
     WeeklyProgressCreate, WeeklyProgressUpdate, WeeklyProgressResponse,
     GeneratePlanRequest, AdjustmentFeedback, AdjustmentSuggestionResponse,
     CurrentWeekResponse, WeekPlan
@@ -104,7 +109,7 @@ async def update_user_profile(
 
 # === Endpoints de Onboarding por pasos ===
 
-@router.post("/onboarding/step1", response_model=UserProfileResponse)
+@router.post("/step1", response_model=UserProfileResponse)
 async def onboarding_step1(
     step_data: OnboardingStep1,
     current_user: User = Depends(get_current_user),
@@ -130,7 +135,7 @@ async def onboarding_step1(
     return profile
 
 
-@router.post("/onboarding/step2", response_model=UserProfileResponse)
+@router.post("/step2", response_model=UserProfileResponse)
 async def onboarding_step2(
     step_data: OnboardingStep2,
     current_user: User = Depends(get_current_user),
@@ -162,7 +167,7 @@ async def onboarding_step2(
     return profile
 
 
-@router.post("/onboarding/step3", response_model=UserProfileResponse)
+@router.post("/step3", response_model=UserProfileResponse)
 async def onboarding_step3(
     step_data: OnboardingStep3,
     current_user: User = Depends(get_current_user),
@@ -192,7 +197,7 @@ async def onboarding_step3(
     return profile
 
 
-@router.post("/onboarding/step4", response_model=UserProfileResponse)
+@router.post("/step4", response_model=UserProfileResponse)
 async def onboarding_step4(
     step_data: OnboardingStep4,
     current_user: User = Depends(get_current_user),
@@ -222,7 +227,7 @@ async def onboarding_step4(
     return profile
 
 
-@router.post("/onboarding/step5", response_model=UserProfileResponse)
+@router.post("/step5", response_model=UserProfileResponse)
 async def onboarding_step5(
     step_data: OnboardingStep5,
     current_user: User = Depends(get_current_user),
@@ -252,7 +257,7 @@ async def onboarding_step5(
     return profile
 
 
-@router.post("/onboarding/step6", response_model=UserProfileResponse)
+@router.post("/step6", response_model=UserProfileResponse)
 async def onboarding_step6(
     step_data: OnboardingStep6,
     current_user: User = Depends(get_current_user),
@@ -282,7 +287,7 @@ async def onboarding_step6(
     return profile
 
 
-@router.post("/onboarding/complete", response_model=UserProfileResponse)
+@router.post("/complete", response_model=UserProfileResponse)
 async def complete_onboarding(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -325,37 +330,132 @@ async def complete_onboarding(
     return profile
 
 
+# === Background task: generación asíncrona con Gemini ===
+
+async def _run_plan_generation_background(plan_id: int, profile_dict: dict, primary_goal: str):
+    """
+    Tarea de fondo que llama a Gemini y persiste el plan completo.
+    Abre su propia sesión de BD para no depender del ciclo de vida del request.
+    """
+    goal_to_plan_type = {
+        "hypertrophy": "strength",
+        "strength": "strength",
+        "bodyweight": "bodyweight",
+        "marathon": "running",
+        "half_marathon": "running",
+        "endurance": "hybrid",
+        "weight_loss": "hybrid",
+        "general_fitness": "hybrid"
+    }
+
+    async with async_session() as session:
+        try:
+            # Llamar a Gemini (puede tardar varios minutos)
+            generation_result = await gemini_service.generate_training_plan(profile_dict)
+            plan_structure = generation_result["plan"]
+
+            # Normalizar la respuesta de Gemini para asegurar compatibilidad
+            if "representative_weeks" in plan_structure and "weeks" not in plan_structure:
+                plan_structure["weeks"] = plan_structure.pop("representative_weeks")
+            for week in plan_structure.get("weeks", []):
+                if "week_example" in week and "week_number" not in week:
+                    week["week_number"] = week.pop("week_example")
+            for phase in plan_structure.get("phases", []):
+                if "weeks_range" in phase and "weeks" not in phase:
+                    wr = phase.pop("weeks_range")
+                    if isinstance(wr, list) and len(wr) == 2:
+                        phase["weeks"] = list(range(wr[0], wr[1] + 1))
+                    else:
+                        phase["weeks"] = wr
+
+            plan_type = goal_to_plan_type.get(primary_goal, "hybrid")
+
+            # Actualizar el plan placeholder con los datos reales
+            result = await session.execute(
+                select(GeneratedPlan).where(GeneratedPlan.id == plan_id)
+            )
+            plan = result.scalar_one()
+            plan.name = plan_structure.get("plan_name", f"Plan de {primary_goal}")
+            plan.description = plan_structure.get("overview", "")
+            plan.total_weeks = plan_structure.get("total_weeks", 16)
+            plan.plan_type = plan_type
+            plan.plan_structure = plan_structure
+            plan.gemini_prompt_used = generation_result.get("prompt_used")
+            plan.gemini_model_version = generation_result.get("model_version")
+            plan.generation_status = "completed"
+            await session.commit()
+            await session.refresh(plan)
+
+            # Crear entradas de progreso semanal
+            for week_num in range(1, plan.total_weeks + 1):
+                week_data = next(
+                    (w for w in plan_structure.get("weeks", []) if w.get("week_number") == week_num),
+                    {}
+                )
+                days = week_data.get("days", [])
+                sessions_planned = sum(
+                    1 for d in days if d.get("type") not in ["rest", "active_recovery"]
+                )
+                session.add(WeeklyProgress(
+                    plan_id=plan.id,
+                    week_number=week_num,
+                    sessions_planned=sessions_planned,
+                    sessions_completed=0
+                ))
+            await session.commit()
+            await session.refresh(plan)
+
+            # Poblar tablas normalizadas de tracking
+            await _populate_plan_tracking(session, plan, plan_structure)
+
+        except Exception as e:
+            logger.exception("Error generando plan id=%s", plan_id)
+            # Marcar el plan como error en una sesión nueva para evitar estado sucio
+            async with async_session() as err_session:
+                result = await err_session.execute(
+                    select(GeneratedPlan).where(GeneratedPlan.id == plan_id)
+                )
+                plan = result.scalar_one_or_none()
+                if plan:
+                    plan.generation_status = "error"
+                    plan.generation_error = "Error interno al generar el plan"
+                    await err_session.commit()
+
+
 # === Endpoints de Generación de Plan con Gemini ===
 
-@router.post("/generate-plan", response_model=GeneratedPlanResponse)
+@router.post("/generate-plan", response_model=PlanGenerationAccepted, status_code=202)
 async def generate_training_plan(
     request: GeneratePlanRequest = GeneratePlanRequest(),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Genera un plan de entrenamiento personalizado usando Gemini AI"""
+    """
+    Lanza la generación del plan con IA en segundo plano y devuelve inmediatamente.
+    Usa GET /plans/{plan_id}/generation-status para saber cuándo está listo.
+    """
     # Obtener perfil del usuario
     result = await db.execute(
         select(UserProfile).where(UserProfile.user_id == current_user.id)
     )
     profile = result.scalar_one_or_none()
-    
+
     if not profile:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Completa el onboarding antes de generar un plan"
         )
-    
-    # Si no quiere regenerar, verificar si ya tiene un plan activo
+
+    # Si no quiere regenerar, verificar si ya tiene un plan activo completado
     if not request.regenerate:
         result = await db.execute(
             select(GeneratedPlan)
             .where(GeneratedPlan.user_profile_id == profile.id)
             .where(GeneratedPlan.is_active == True)
+            .where(GeneratedPlan.generation_status == "completed")
             .limit(1)
         )
         existing_plan = result.scalars().first()
-        
         if existing_plan:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -368,11 +468,10 @@ async def generate_training_plan(
             .where(GeneratedPlan.user_profile_id == profile.id)
             .where(GeneratedPlan.is_active == True)
         )
-        existing_plans = result.scalars().all()
-        for plan in existing_plans:
+        for plan in result.scalars().all():
             plan.is_active = False
-    
-    # Convertir perfil a diccionario para Gemini
+
+    # Convertir perfil a diccionario para la tarea de fondo
     profile_dict = {
         "age": profile.age,
         "gender": profile.gender,
@@ -406,96 +505,71 @@ async def generate_training_plan(
         "disliked_exercises": profile.disliked_exercises or [],
         "favorite_exercises": profile.favorite_exercises or []
     }
-    
-    try:
-        # Generar plan con Gemini
-        generation_result = await gemini_service.generate_training_plan(profile_dict)
-        plan_structure = generation_result["plan"]
-        
-        # Normalizar la respuesta de Gemini para asegurar compatibilidad
-        # representative_weeks → weeks (si Gemini usó el nombre antiguo)
-        if "representative_weeks" in plan_structure and "weeks" not in plan_structure:
-            plan_structure["weeks"] = plan_structure.pop("representative_weeks")
-        
-        # Normalizar semanas: week_example → week_number
-        for week in plan_structure.get("weeks", []):
-            if "week_example" in week and "week_number" not in week:
-                week["week_number"] = week.pop("week_example")
-        
-        # Normalizar fases: weeks_range [1, 4] → weeks [1, 2, 3, 4]
-        for phase in plan_structure.get("phases", []):
-            if "weeks_range" in phase and "weeks" not in phase:
-                wr = phase.pop("weeks_range")
-                if isinstance(wr, list) and len(wr) == 2:
-                    phase["weeks"] = list(range(wr[0], wr[1] + 1))
-                else:
-                    phase["weeks"] = wr
-        
-        # Determinar tipo de plan basado en objetivo
-        goal_to_plan_type = {
-            "hypertrophy": "strength",
-            "strength": "strength",
-            "bodyweight": "bodyweight",
-            "marathon": "running",
-            "half_marathon": "running",
-            "endurance": "hybrid",
-            "weight_loss": "hybrid",
-            "general_fitness": "hybrid"
-        }
-        plan_type = goal_to_plan_type.get(profile.primary_goal, "hybrid")
-        
-        # Crear el plan en la base de datos
-        new_plan = GeneratedPlan(
-            user_profile_id=profile.id,
-            name=plan_structure.get("plan_name", f"Plan de {profile.primary_goal}"),
-            description=plan_structure.get("overview", ""),
-            total_weeks=plan_structure.get("total_weeks", 16),
-            plan_type=plan_type,
-            primary_focus=profile.primary_goal,
-            plan_structure=plan_structure,
-            is_active=True,
-            started_at=datetime.now(timezone.utc),
-            gemini_prompt_used=generation_result.get("prompt_used"),
-            gemini_model_version=generation_result.get("model_version")
+
+    # Crear plan placeholder con estado 'generating'
+    goal_to_plan_type = {
+        "hypertrophy": "strength", "strength": "strength", "bodyweight": "bodyweight",
+        "marathon": "running", "half_marathon": "running",
+        "endurance": "hybrid", "weight_loss": "hybrid", "general_fitness": "hybrid"
+    }
+    placeholder = GeneratedPlan(
+        user_profile_id=profile.id,
+        name="Tu plan personalizado (generando...)",
+        description="",
+        total_weeks=16,
+        plan_type=goal_to_plan_type.get(profile.primary_goal, "hybrid"),
+        primary_focus=profile.primary_goal,
+        plan_structure={},
+        is_active=True,
+        started_at=datetime.now(timezone.utc),
+        generation_status="generating",
+    )
+    db.add(placeholder)
+    await db.commit()
+    await db.refresh(placeholder)
+    plan_id = placeholder.id
+
+    # Lanzar la generación en segundo plano (sin bloquear el request)
+    asyncio.create_task(
+        _run_plan_generation_background(plan_id, profile_dict, profile.primary_goal or "general_fitness")
+    )
+
+    return PlanGenerationAccepted(
+        plan_id=plan_id,
+        status="generating",
+        message=(
+            "Tu plan personalizado con IA está siendo creado. "
+            "Nuestro sistema está analizando tu perfil, objetivos y disponibilidad "
+            "para diseñar un programa completamente adaptado a ti. "
+            "Esto puede tardar entre 1 y 3 minutos."
         )
-        
-        db.add(new_plan)
-        await db.commit()
-        await db.refresh(new_plan)
-        
-        # Crear entradas de progreso semanal
-        total_weeks = plan_structure.get("total_weeks", 16)
-        for week_num in range(1, total_weeks + 1):
-            week_data = next(
-                (w for w in plan_structure.get("weeks", []) if w.get("week_number") == week_num),
-                {}
-            )
-            days = week_data.get("days", [])
-            sessions_planned = sum(1 for d in days if d.get("type") not in ["rest", "active_recovery"])
-            
-            progress = WeeklyProgress(
-                plan_id=new_plan.id,
-                week_number=week_num,
-                sessions_planned=sessions_planned,
-                sessions_completed=0
-            )
-            db.add(progress)
-        
-        await db.commit()
-        await db.refresh(new_plan)
-        
-        # === Auto-populate plan tracking tables ===
-        await _populate_plan_tracking(db, new_plan, plan_structure)
-        
-        return new_plan
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error al generar el plan. Por favor, inténtalo de nuevo."
-        )
+    )
+
+
+@router.get("/plans/{plan_id}/generation-status", response_model=PlanGenerationStatus)
+async def get_plan_generation_status(
+    plan_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Consulta el estado de generación de un plan (para polling desde el frontend)."""
+    result = await db.execute(
+        select(UserProfile).where(UserProfile.user_id == current_user.id)
+    )
+    profile = result.scalar_one_or_none()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Perfil no encontrado")
+
+    result = await db.execute(
+        select(GeneratedPlan)
+        .where(GeneratedPlan.id == plan_id)
+        .where(GeneratedPlan.user_profile_id == profile.id)
+    )
+    plan = result.scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan no encontrado")
+
+    return plan
 
 
 @router.get("/plans", response_model=list[GeneratedPlanSummary])
@@ -859,15 +933,16 @@ async def get_adjustment_suggestions(
         return suggestions
         
     except Exception as e:
+        logger.exception("Error al obtener sugerencias de progresión")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error al obtener sugerencias: {str(e)}"
+            detail="Error al obtener sugerencias de progresión"
         )
 
 
 # === Estado del onboarding ===
 
-@router.get("/onboarding/status")
+@router.get("/status")
 async def get_onboarding_status(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
